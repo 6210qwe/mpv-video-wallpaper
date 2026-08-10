@@ -205,11 +205,12 @@ class WallpaperPlayer:
     PIPE_NAME = r"\\.\pipe\mpvwallpaper"
 
     def __init__(self, mpv_path=None, vo="direct3d", hwdec="auto-copy",
-                 fill="cover", audio=True):
+                 fill="cover", audio=True, loop=True):
         self.vo = vo
         self.hwdec = hwdec
         self.fill = fill
         self.audio = audio          # True=有声(默认不静音) / False=静音
+        self.loop = loop            # True=单曲循环(壁纸常驻) / False=播一次靠脚本切换(轮播)
         self._auto_mpv = mpv_path is None   # 是否走自动查找
         self.mpv_path = mpv_path or self._find_mpv()
         self.hwnd = None
@@ -323,10 +324,11 @@ class WallpaperPlayer:
     def launch_mpv(self, video_path):
         """启动 mpv, 渲染到已嵌入的窗口 (仅需调用一次)"""
         panscan = "1.0" if self.fill == "cover" else "0"
+        loop_flag = "--loop=inf" if self.loop else "--loop=no"
         cmd = [
             self.mpv_path,
             f"--wid={self.hwnd}",
-            "--loop=inf",
+            loop_flag,
             "--keep-open",
             "--no-terminal",
             f"--input-ipc-server={self.PIPE_NAME}",
@@ -470,6 +472,7 @@ def main():
         if not videos:
             print(f"[X] 目录中没有视频文件: {args.path}")
             return
+        random.shuffle(videos)   # 首轮也打乱, 避免第一个视频永远固定
         single_mode = False
     else:
         print(f"[X] 路径不存在: {args.path}")
@@ -482,9 +485,12 @@ def main():
         mode = "无限循环" if args.rounds == 0 else f"{args.rounds} 轮"
         print(f"模式: 目录循环 ({mode}, 每视频 {args.interval}s, Ctrl+C 退出)")
 
+    # 单视频 / 仅 1 个视频的目录 → 循环播放(常驻壁纸);
+    # 多视频目录 → 播一次靠脚本切换(避免回放开头几秒)
+    loop = single_mode or len(videos) == 1
     player = WallpaperPlayer(
         mpv_path=args.mpv, vo=args.vo, hwdec=args.hwdec,
-        fill=args.fill, audio=args.audio,
+        fill=args.fill, audio=args.audio, loop=loop,
     )
 
     print("\n[1/3] 前置检查...")

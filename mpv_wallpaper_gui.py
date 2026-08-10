@@ -61,6 +61,7 @@ class WallpaperApp:
         self.player = None        # WallpaperPlayer 实例
         self.running = False
         self.thread = None
+        self._playlist = None
         self.config = self._load_config()
         self._build_vars()
         self._build_ui()
@@ -324,16 +325,19 @@ class WallpaperApp:
             self.log("⚠ 该目录没有找到 mp4 视频")
             return
 
-        self._save_config()
+        playlist = self._build_playlist(videos)
+        self._playlist = playlist
         mode_name = "随机" if self.mode.get() == "random" else "顺序"
         switch_name = "按视频时长" if self.switch_mode.get() == "duration" else "固定时长"
         self.log(f"▶ 启动壁纸：共 {len(videos)} 个视频，{mode_name} / {switch_name}")
 
         # 创建播放器 + 嵌入桌面 + 启动 mpv（仅此一次 embed）
+        # 多视频目录不循环(播一次靠脚本切换, 避免回放开头); 仅 1 个视频则循环常驻
         self.player = mpv_wallpaper.WallpaperPlayer(
             mpv_path=mpv_path or None,
             fill="cover" if self.panscan_var.get() == "1.0" else "contain",
             audio=self.audio_var.get(),
+            loop=(len(videos) == 1),
         )
         if not self.player.check_prerequisites():
             self.player = None
@@ -342,7 +346,7 @@ class WallpaperApp:
             self.player.stop()
             self.player = None
             return
-        if not self.player.launch_mpv(videos[0]):
+        if not self.player.launch_mpv(playlist[0]):
             self.player.stop()
             self.player = None
             return
@@ -356,13 +360,14 @@ class WallpaperApp:
 
     def _playback_loop(self):
         try:
-            playlist = self._build_playlist(self._scan_videos())
-            # 第一支已在 start() 里播上, 这里只等时长 → 切下一个
+            playlist = self._playlist
+            # 第一支已在 start() 里播上(已是洗牌/顺序后的 playlist[0]), 这里只等时长 → 切下一个
             self._wait(self._wait_secs(playlist[0]))
             idx = 1
             while self.running:
-                if idx >= len(playlist):          # 一轮播完 → 继续循环
+                if idx >= len(playlist):          # 一轮播完 → 重新洗牌/顺序, 继续循环
                     playlist = self._build_playlist(self._scan_videos())
+                    self._playlist = playlist
                     idx = 0
                 item = playlist[idx]
                 name = os.path.basename(item)
