@@ -173,8 +173,13 @@ def find_window_by_class(cls_name):
     return found[0] if found else None
 
 
-def find_children_by_class(parent_hwnd, cls_name):
-    """找父窗口下指定类名的所有子窗口"""
+def find_children_by_class(parent_hwnd, cls_name, recursive=True):
+    """找父窗口下指定类名的所有子窗口（含后代，兼容 Win10/Win11 不同桌面层级）。
+
+    Win10 的 WorkerW 通常嵌套在 SHELLDLL_DefView 之下，不是 Progman 的直接子窗口；
+    若只枚举直接子会漏掉它，从而在 Win10 上提示"找不到 WorkerW 子窗口"。
+    recursive=True（默认）递归枚举所有后代，两种布局都能命中。
+    """
     found = []
 
     def _cb(hwnd, lparam):
@@ -182,9 +187,12 @@ def find_children_by_class(parent_hwnd, cls_name):
         user32.GetClassNameW(hwnd, buf, 256)
         if buf.value == cls_name:
             found.append(hwnd)
+        if recursive:
+            user32.EnumChildWindows(hwnd, WNDENUMPROC(_cb), 0)
         return True
 
-    user32.EnumChildWindows(parent_hwnd, WNDENUMPROC(_cb), 0)
+    cb = WNDENUMPROC(_cb)  # 保活回调，避免 ctypes 临时对象被 GC
+    user32.EnumChildWindows(parent_hwnd, cb, 0)
     return found
 
 
@@ -501,26 +509,66 @@ class WallpaperPlayer:
         for ln in self._mpv_lines[-max_lines:]:
             print(f"  [mpv] {ln}")
 
-    def stop(self):
+    def kill_mpv_now(self):
+        """立即向 mpv 发送终止信号并关闭 IPC 管道, 立即返回(**不等待**)。
+
+        目的是让音频/视频在点击"停止"的瞬间就停止。
+        该方法**不阻塞**, 可在 UI 主线程同步调用。
+        真正的等待 + 窗口销毁请交给 terminate_mpv()/stop()。
+        """
         if self._stopped:
             return
         self._stopped = True
         self._ipc_alive = False
-        print("\n--- 清理 ---")
+        print("\n--- 清理：终止 mpv ---")
         if self.pipe_handle:
             kernel32.CloseHandle(self.pipe_handle)
             self.pipe_handle = None
         if self.mpv_proc and self.is_running():
-            self.mpv_proc.terminate()
+            self.mpv_proc.terminate()  # 强制杀进程, 音频立刻停
+            print("  mpv 终止信号已发送")
+
+    def terminate_mpv(self):
+        """终止 mpv 进程并等待其彻底退出。
+
+        设计为可放后台线程执行, 不阻塞 UI 线程。
+        注意: 这里**不**销毁窗口, 因为窗口销毁(DestroyWindow)必须在创建它的
+        同一线程(即 UI 线程)进行, 由 destroy_window() 负责。
+        """
+        self.kill_mpv_now()
+        if self.mpv_proc and self.is_running():
             try:
                 self.mpv_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.mpv_proc.kill()
+            # 给操作系统一点时间回收 mpv 的子窗口。若立刻 DestroyWindow,
+            # Windows 会向尚未消失的 mpv 子窗口发消息并挂起, 导致调用线程卡死。
+            for _ in range(20):
+                if self.mpv_proc.poll() is not None:
+                    break
+                time.sleep(0.05)
             print("  mpv 已终止")
+
+    def hide_window(self):
+        """立即隐藏桌面窗口, 让壁纸在点"停止"的瞬间消失 (即时视觉反馈)。
+        **必须**在创建该窗口的 UI 线程调用。"""
         if self.hwnd and user32.IsWindow(self.hwnd):
+            user32.ShowWindow(self.hwnd, 0)  # SW_HIDE = 0
+
+    def destroy_window(self):
+        """销毁桌面 LAYERED 窗口。**必须**在创建该窗口的 UI 线程调用。"""
+        if self.hwnd and user32.IsWindow(self.hwnd):
+            print("  销毁窗口")
             user32.DestroyWindow(self.hwnd)
             print("  窗口已销毁")
         self.hwnd = None
+
+    def stop(self):
+        """同步退出: 终止 mpv + 销毁窗口。供程序关闭(_on_close)等需要同步等待的场景。"""
+        if self._stopped:
+            return
+        self.terminate_mpv()
+        self.destroy_window()
         print("--- 已退出 (未调用 SystemParametersInfo) ---")
 
 

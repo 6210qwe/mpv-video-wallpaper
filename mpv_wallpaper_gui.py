@@ -333,6 +333,9 @@ class WallpaperApp:
         self.root.after(0, lambda: self.log(f"▶ {name}  ({fmt_duration(duration)})"))
 
     def start(self):
+        if self.running:
+            # 防重入: 已在运行时忽略, 防止疯狂点击"开始"创建多个 mpv 实例/桌面窗口
+            return
         mpv_path = self.mpv_path.get().strip()
         if self.single_var.get():
             # 单个视频: 循环播放该文件 (最稳, 全程零切换, 无 EOF 冻结)
@@ -445,15 +448,46 @@ class WallpaperApp:
             return
         self.running = False
         self._stopped_token = self._run_token
-        if self.player is not None:
-            self.player.stop()
-            self.player = None
-        if getattr(self, "_m3u_path", None) and os.path.isfile(self._m3u_path):
-            try:
-                os.remove(self._m3u_path)
-            except Exception:
-                pass
+        # 立即复位 UI, 让点击"停止"后有即时反馈, 不再卡在"停止中"无响应
         self._on_stopped(self._run_token)
+
+        player = self.player
+        self.player = None
+        m3u = getattr(self, "_m3u_path", None)
+        if player is None:
+            return
+
+        # 关键: 在 UI 主线程**同步**地立刻杀掉 mpv 进程 (terminate 只发信号, 立即返回, 不阻塞),
+        # 同时隐藏桌面窗口。这样点"停止"的一瞬间, 声音和画面**同时**停止,
+        # 不会再出现"画面没了但声音还在"的现象。
+        # 注意: 不能在这里调 destroy_window, 否则 DestroyWindow 会向残留的 mpv
+        # 子窗口发消息并挂起 UI 线程。
+        try:
+            player.kill_mpv_now()   # 声音立刻停
+            player.hide_window()    # 画面立刻消失
+        except Exception:
+            pass
+
+        def _finish_destroy(p, m):
+            # 在 UI 线程销毁窗口 (DestroyWindow 必须在创建窗口的线程调用)
+            p.destroy_window()
+            if m and os.path.isfile(m):
+                try:
+                    os.remove(m)
+                except Exception:
+                    pass
+
+        def _bg_stop():
+            # 后台线程: 仅等待 mpv 真正退出 (最多 3 秒), 不阻塞 UI
+            if player.mpv_proc and player.mpv_proc.poll() is None:
+                try:
+                    player.mpv_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    player.mpv_proc.kill()
+            # mpv 彻底退出后, 回到 UI 线程销毁桌面窗口
+            self.root.after(0, lambda: _finish_destroy(player, m3u))
+
+        threading.Thread(target=_bg_stop, daemon=True).start()
 
     def _on_stopped(self, token=None):
         # token 校验: 仅当仍是同一轮运行时才复位按钮, 防止旧线程的延迟回调误复位新一轮
