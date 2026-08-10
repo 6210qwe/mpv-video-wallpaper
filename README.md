@@ -12,31 +12,29 @@
 
 我有一台新电脑（Windows 11 25H2，Build 26200），想用视频当桌面壁纸，并且**有频繁关闭 / 重启壁纸软件的需求**（因为电脑上长期跑着别的任务，不想因为壁纸软件出问题而被迫重启，那样太耽误事）。
 
-于是我试了市面上常见的方案，结果都翻车了。
+之前在 **Windows 10** 上一直接用 ChromaFlux，运行得**非常完美**，反复开关几十次都稳。但升级到 **Windows 11** 之后，巨硬（Microsoft）又把桌面窗口布局给乱改了一通，导致原来那套桌面嵌入方式在新系统上直接失效。
 
-### 1.1 踩过的坑
+市面上现成的方案也都用不顺手：
 
-| 软件 | 表现 |
-|------|------|
-| **ChromaFlux** (`ChromaFluxService.exe`) | 正常用没问题；但只要反复「启动 → 关闭 → 再启动」循环约 **5~6 次**，就会持续弹出**“设置桌面父窗口失败”**，此后无论如何重启该软件都无效，**必须重启电脑**才能恢复。 |
-| **Lively Wallpaper** | 同样的现象——反复启停 5 次左右就失效。 |
-| **Wallpaper Engine 免费版** | 功能受限，不满足需求；付费版又担心付完钱也是同样的坑。 |
+- **Wallpaper Engine**：功能确实强，但它是 Steam 上的**付费软件**，而我只是想挂个视频壁纸，懒得为了它去下个 Steam。
 
-### 1.2 排查结论
+既然现成的要么用不了、要么懒得折腾，干脆自己写一个：基于 [mpv](https://mpv.io/) 播放器 + 原生 Win32 窗口嵌入，专门针对 Win11 26200 的桌面架构做了适配，能稳定跑、频繁开关也不崩。
 
-经过大量实测（PowerShell / Python+ctypes 各种脚本），逐步定位到根因：
+> 说明：本项目与 ChromaFlux 没有任何代码关联，只是当初在 Win10 上它用得很顺手，
+> 升级 Win11 后才发现那一套嵌入方式失效了，所以才催生了这个项目。
 
-1. **这不是某个软件的 bug，是 Windows 11 25H2 桌面架构层面的变更。**
-   - 同一份 ChromaFlux 在 **Windows 10** 上反复启停几十次完全正常；
-   - 在 **Windows 11 Build 26200** 上必现；
-   - **Lively Wallpaper 在 26200 上同样出问题**，说明是系统级的。
+### 1.1 根因：Win11 又改了桌面窗口布局
 
-2. **Win11 26200 的 Progman 改用了 raised desktop 模式**（窗口带 `WS_EX_NOREDIRECTIONBITMAP` 样式）。
+经过实测与排查，根因不在某个具体软件，而在 **Windows 11 25H2 的桌面架构变更**：
+
+1. **Win11 26200 的 Progman 改用了 raised desktop 模式**（窗口带 `WS_EX_NOREDIRECTIONBITMAP` 样式）。
    - 经典的 `SetParent(视频窗口, WorkerW)` 技术在此环境下被 **DWM 合成器静默丢弃**——
      `SetParent` 返回“成功”（非零值），但 `GetParent` 验证发现窗口根本没真正挂上去。
 
-3. **退出时反复调用 `SystemParametersInfo(SPI_SETDESKWALLPAPER)` 刷新桌面**，会逐步损坏 explorer 的桌面合成状态机；
+2. **退出时反复调用 `SystemParametersInfo(SPI_SETDESKWALLPAPER)` 刷新桌面**，会逐步损坏 explorer 的桌面合成状态机；
    状态机一旦损坏，只能重启电脑恢复。
+
+这就是为什么 Win10 上那套方案好好的，到了 Win11 26200 就失灵——不是软件的问题，是系统层面的窗口布局又被改了。
 
 > 参考项目（方案验证来源）：
 > - Gitee: [zip-ping/bsod-simulation-app](https://gitee.com/zip-ping/bsod-simulation-app) —— Win10 22H2 到 Win11 26200 通用的桌面层注入方案，明确写了「不加 `WS_EX_LAYERED`，跨进程非 LAYERED 子窗口会被 DWM 静默丢弃」。
@@ -174,7 +172,7 @@ python mpv_wallpaper_gui.py
 ## 七、已知限制 / 注意事项
 
 - **多显示器**：当前嵌入主显示器（`Progman` 下的第一个可见 `WorkerW`），未做多屏分发。
-- **桌面状态已损坏时**：若此前因其他软件（ChromaFlux / Lively）把桌面搞崩了，
+- **桌面状态已损坏时**：若此前因其它壁纸软件把桌面搞崩了，
   本程序也可能无法嵌入——此时**重启一次电脑**即可恢复干净环境，之后本程序可正常使用。
 - **mpv 路径**：自动查找仅覆盖 `PATH` 与脚本同级目录；放在别处请显式 `--mpv` 指定。
 - 仅依赖标准库 + `tkinter`，无需 `pip install` 任何第三方包。
@@ -218,6 +216,6 @@ A: 渲染器兼容问题，试 `--vo gpu`（命令行）或在 GUI 改渲染器�
 **Q: 之前被别的壁纸软件搞崩了，现在本程序也失效？**
 A: 桌面合成状态机已被损坏，重启一次电脑即可。本程序本身不会造成这种损坏。
 
-**Q: 这和 ChromaFlux / Lively 是什么关系？**
+**Q: 这和 ChromaFlux / Wallpaper Engine 等是什么关系？**
 A: 没有关系。本项目是独立重写、专为 Win11 26200 的 raised desktop 架构设计，
-   不依赖也更稳定。发现的问题已整理可作为 ChromaFlux 作者的修复参考。
+   不依赖任何现成壁纸软件。
