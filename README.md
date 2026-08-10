@@ -61,7 +61,10 @@
   实测：不加 LAYERED 时窗口能挂上 WorkerW 但黑屏；加上后视频正常出画面。
 - **创建时即为 WorkerW 子窗口**，不走 `SetParent`，绕开“被静默丢弃”的坑。
 - **退出只销毁窗口 + 终止 mpv 进程**，不调用 `SystemParametersInfo`，因此不会累积损坏桌面状态——这正是「能频繁开关」的根本原因。
-- **切视频不靠 `--{ }` 分组、也不靠脚本在 EOF 后硬切**：按视频时长 / 单视频模式把路径写成 `.m3u8` 播放列表文件交给 mpv（`--playlist` + `--loop-playlist=inf`），文件数无上限；固定时长模式则让当前视频 `--loop=inf` 一直在播放中循环，用定时器 `loadfile` 在「播放中途」切下一个，根本不会走到 EOF 冻结。
+- **切视频不靠 `--{ }` 分组、也不靠脚本在 EOF 后硬切**：
+  - **单视频**：`--loop=inf` 直接常驻，全程零切换；
+  - **按视频时长（多文件）**：把路径写成 `.m3u8` 播放列表文件交给 mpv（`--playlist` + `--loop-playlist=inf`），每个视频完整播完再接力，文件数无上限；
+  - **固定时长**：当前视频 `--loop=inf` 一直在播放中循环，用定时器 `loadfile` 在「播放中途」切下一个，根本不会走到 EOF 冻结。
 - **运行中改填充 / 改声音走 mpv IPC**（`set_property`），不重新嵌入桌面，也不重建播放列表。
 
 ### 2.1 兼容性说明
@@ -129,7 +132,8 @@ python mpv_wallpaper.py "D:\video.mp4" --audio
 | `--audio` | 关闭 | 加此参数才出声（默认静音） |
 | `--vo` | `direct3d` | 渲染器：`direct3d` / `gpu` / `auto` |
 | `--hwdec` | `auto-copy` | 硬件解码：`auto-copy` / `auto` / `no` |
-| `--interval` | `10` | 每视频最大播放秒数（目录模式，`0`=按视频时长播完） |
+| `--interval` | `10` | 固定时长模式下每视频最大播放秒数 |
+| `--duration` | 关闭 | 加此参数改为「按视频时长」模式（每个视频完整播完再切） |
 
 > 提示：桌面出现黑屏时，尝试 `--vo gpu`；mpv 秒退时，尝试 `--hwdec no`。
 
@@ -143,10 +147,11 @@ python mpv_wallpaper_gui.py
 
 界面字段：
 
-- **视频目录**：选择存放 mp4 的文件夹（可勾选「包含子文件夹」）。
+- **视频目录**：选择存放视频文件的文件夹（支持 mp4/mkv/avi/webm/mov/flv，可勾选「包含子文件夹」）。
+- **单个视频（循环播放）**：勾选后「浏览」改为选择单个视频文件并无限循环（全程零切换、最稳）；勾选时「包含子文件夹 / 播放顺序 / 切换方式 / 固定间隔」自动禁用。
 - **mpv.exe 路径**：留空自动查找（PATH / 脚本同级目录）；也可点「浏览」指定。
 - **播放顺序**：随机 / 顺序。
-- **切换方式**：固定时长 / 按视频时长（自动读取 mp4 时长，无需 ffmpeg）。
+- **切换方式**：固定时长（每视频播固定秒数）/ 按视频时长（每个视频完整播完再切）。
 - **固定间隔**：「固定时长」模式下每视频播放秒数。
 - **填充方式**：原比例 / 铺满裁剪。
 - **开启声音**：勾选后出声（默认静音）。
@@ -179,21 +184,7 @@ python mpv_wallpaper_gui.py
 
 ---
 
-## 八、项目结构
-
-```
-mpv-video-wallpaper/
-├── mpv_wallpaper.py     # 播放核心：Win32 嵌入 + mpv 控制（可作为模块 import）
-├── mpv_wallpaper_gui.py # 图形界面：控制上面的播放核心
-└── README.md            # 本文档
-```
-
-`mpv_wallpaper_gui.py` 通过 `import mpv_wallpaper` 调用 `WallpaperPlayer`，
-两个文件需放在同一目录。
-
----
-
-## 九、打包成单文件 exe（可选）
+## 八、打包成单文件 exe（可选）
 
 ```bash
 pip install pyinstaller
@@ -202,20 +193,3 @@ pyinstaller --noconsole --onefile --name MpvWallpaper mpv_wallpaper_gui.py
 
 生成的 `dist/MpvWallpaper.exe` 需与 `mpv_wallpaper.py` 同目录（或把 mpv.exe 一并打包/放到 PATH）。
 
----
-
-## 十、常见问题
-
-**Q: 提示“找不到 mpv.exe”？**
-A: 把 mpv.exe 加入 PATH，或放到脚本同级目录（`mpv.exe` 或 `mpv/mpv.exe`），
-   或用 `--mpv` 显式指定。
-
-**Q: 桌面黑屏但有声音？**
-A: 渲染器兼容问题，试 `--vo gpu`（命令行）或在 GUI 改渲染器后重试。
-
-**Q: 之前被别的壁纸软件搞崩了，现在本程序也失效？**
-A: 桌面合成状态机已被损坏，重启一次电脑即可。本程序本身不会造成这种损坏。
-
-**Q: 这和 ChromaFlux / Wallpaper Engine 等是什么关系？**
-A: 没有关系。本项目是独立重写、专为 Win11 26200 的 raised desktop 架构设计，
-   不依赖任何现成壁纸软件。
