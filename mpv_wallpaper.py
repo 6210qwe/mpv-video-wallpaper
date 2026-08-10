@@ -219,6 +219,12 @@ class WallpaperPlayer:
         self.pipe_handle = None
         self._stopped = False
         self._mpv_lines = []        # mpv 输出缓冲, 异常时回吐
+        self._ipc_alive = False
+        self.on_now_playing = None     # 回调: (path:str, duration:float|None) -> 显示"正在播放"
+        self._np_path = None
+        self._np_duration = None
+        self._np_last = None
+        self._np_got_dur = False
         self._register_window_class()
 
     # -------------------- 初始化 --------------------
@@ -382,6 +388,12 @@ class WallpaperPlayer:
                          daemon=True).start()
 
         self.pipe_handle = self._connect_pipe()
+        if self.pipe_handle and self.on_now_playing:
+            # 订阅 path/duration 属性变化, 供 GUI 实时显示"正在播放: 名称 + 时长"
+            self._ipc_command(["observe_property", 1, "path"])
+            self._ipc_command(["observe_property", 2, "duration"])
+            self._ipc_alive = True
+            threading.Thread(target=self._ipc_reader, daemon=True).start()
         print("  IPC: 已连接" if self.pipe_handle else "  [!] IPC 未连接 (无法运行时改填充/声音)")
         return True
 
@@ -415,6 +427,60 @@ class WallpaperPlayer:
             self.pipe_handle, data, len(data), ctypes.byref(written), None
         )
 
+    def _ipc_reader(self):
+        """后台读取 mpv IPC 管道, 解析 property-change 事件。
+        仅当设置了 on_now_playing 回调时才启动, 用于实时显示"正在播放"信息。"""
+        try:
+            buf = b""
+            chunk = ctypes.create_string_buffer(4096)
+            rd = w.DWORD(0)
+            while self._ipc_alive and self.pipe_handle:
+                ok = kernel32.ReadFile(self.pipe_handle, chunk, 4096,
+                                       ctypes.byref(rd), None)
+                if not ok or rd.value == 0:
+                    break
+                buf += chunk.raw[:rd.value]
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line.decode("utf-8", "replace"))
+                    except Exception:
+                        continue
+                    self._handle_ipc(msg)
+        except Exception:
+            pass
+        finally:
+            self._ipc_alive = False
+
+    def _handle_ipc(self, msg):
+        """处理 mpv IPC 的 property-change 事件: 当前文件路径变化 + 时长 -> 回调显示正在播放"""
+        if msg.get("event") != "property-change":
+            return
+        name = msg.get("name")
+        data = msg.get("data")
+        if name == "path":
+            if data and data != self._np_path:
+                self._np_path = data
+                self._np_got_dur = False   # 等待新文件的时长到达
+        elif name == "duration":
+            try:
+                self._np_duration = float(data) if data is not None else None
+            except Exception:
+                self._np_duration = None
+        # 新文件已加载且拿到时长 -> 触发一次"正在播放"回调
+        if (self._np_path and self._np_path != self._np_last
+                and self._np_duration and not self._np_got_dur):
+            self._np_got_dur = True
+            self._np_last = self._np_path
+            if self.on_now_playing:
+                try:
+                    self.on_now_playing(self._np_path, self._np_duration)
+                except Exception:
+                    pass
+
     def set_panscan(self, value):
         """运行中改填充: 0=原比例, 1=铺满裁剪"""
         return self._ipc_command(["set_property", "panscan", float(value)])
@@ -439,6 +505,7 @@ class WallpaperPlayer:
         if self._stopped:
             return
         self._stopped = True
+        self._ipc_alive = False
         print("\n--- 清理 ---")
         if self.pipe_handle:
             kernel32.CloseHandle(self.pipe_handle)

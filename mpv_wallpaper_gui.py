@@ -26,6 +26,16 @@ CONFIG_PATH = os.path.join(
 DEFAULT_WAIT = 30
 
 
+def fmt_duration(sec):
+    """秒 -> M:SS / H:MM:SS"""
+    if not sec or sec <= 0:
+        return "--:--"
+    sec = int(round(sec))
+    h, m = divmod(sec, 3600)
+    m, s = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 class WallpaperApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -99,7 +109,8 @@ class WallpaperApp:
     def _build_ui(self):
         self.root.title("mpv 视频壁纸")
         self.root.geometry("560x690")
-        self.root.resizable(False, False)
+        self.root.minsize(520, 560)           # 最小尺寸兜底, 缩太小时布局不会乱
+        self.root.resizable(True, True)       # 允许自由拖拽缩放窗口
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         ttk.Label(self.root, text="mpv 视频壁纸",
@@ -314,6 +325,13 @@ class WallpaperApp:
             return
         self.player.set_mute(not self.audio_var.get())
 
+    def _on_now_playing(self, path, duration):
+        """mpv 播放核心回调: 在日志中显示正在播放的视频名称 + 时长"""
+        if not self.running:
+            return
+        name = os.path.basename(path)
+        self.root.after(0, lambda: self.log(f"▶ {name}  ({fmt_duration(duration)})"))
+
     def start(self):
         mpv_path = self.mpv_path.get().strip()
         if self.single_var.get():
@@ -351,6 +369,7 @@ class WallpaperApp:
             fill="cover" if self.panscan_var.get() == "1.0" else "contain",
             audio=self.audio_var.get(),
         )
+        self.player.on_now_playing = self._on_now_playing
         if not self.player.check_prerequisites():
             self.player = None
             return
@@ -391,7 +410,6 @@ class WallpaperApp:
             n = len(playlist)
             if (self.switch_mode.get() == "duration") or n == 1:
                 # 时长模式 / 单视频: mpv 内部循环, 这里只监控存活
-                self.log(f"▶ 已启动（mpv 内部循环），共 {n} 个视频")
                 while self.running:
                     if not self.player.is_running():
                         self.log("  ✗ mpv 已退出（桌面状态可能已退化，建议重启电脑后重试）")
@@ -400,14 +418,12 @@ class WallpaperApp:
             else:
                 # 固定时长: 定时 loadfile 切换 (当前视频恒在播放中, 避开 EOF 冻结)
                 interval = max(1, self.wait_var.get())
-                self.log(f"▶ 已启动，每 {interval}s 切换，共 {n} 个视频")
                 idx = 1  # 第 0 支已在 launch 中播上
                 while self.running:
                     if not self.player.is_running():
                         self.log("  ✗ mpv 已退出（桌面状态可能已退化，建议重启电脑后重试）")
                         break
                     self.player.play(playlist[idx % n], loop=True)
-                    self.log(f"  ▶ {os.path.basename(playlist[idx % n])}  ({idx % n + 1}/{n})")
                     idx += 1
                     for _ in range(interval * 10):
                         if not self.running:
@@ -429,7 +445,6 @@ class WallpaperApp:
             return
         self.running = False
         self._stopped_token = self._run_token
-        self.log("■ 正在停止（卸载桌面嵌入层）…")
         if self.player is not None:
             self.player.stop()
             self.player = None
@@ -449,7 +464,6 @@ class WallpaperApp:
         self._on_switch_mode()
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
-        self.log("■ 已停止")
 
 
 def main():
