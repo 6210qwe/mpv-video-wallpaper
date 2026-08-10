@@ -33,6 +33,8 @@ class WallpaperApp:
         self.running = False
         self.thread = None
         self._playlist = None
+        self._run_token = 0          # 每轮运行的唯一代次, 防止旧线程的 _on_stopped 误复位新一轮
+        self._stopped_token = -1      # 被用户主动停止的是哪一轮
         self.config = self._load_config()
         self._build_vars()
         self._build_ui()
@@ -373,14 +375,17 @@ class WallpaperApp:
             if not self.player.launch([playlist[0]]):
                 self.player.stop(); self.player = None; return
 
+        self._run_token += 1
+        token = self._run_token
         self.running = True
         self._set_inputs("disabled")
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        self.thread = threading.Thread(target=self._playback_loop, daemon=True)
+        self.thread = threading.Thread(target=self._playback_loop,
+                                       args=(token,), daemon=True)
         self.thread.start()
 
-    def _playback_loop(self):
+    def _playback_loop(self, token):
         try:
             playlist = self._playlist
             n = len(playlist)
@@ -406,13 +411,16 @@ class WallpaperApp:
                     idx += 1
                     for _ in range(interval * 10):
                         if not self.running:
-                            return
+                            break
                         time.sleep(0.1)
         except Exception as e:
             self.log(f"✗ 运行出错：{e}")
         finally:
+            # 仅当此轮 mpv 意外退出(用户未主动停止这一轮)时才复位按钮;
+            # 用户点停止时 stop() 已复位, 且旧线程若误触发 _on_stopped 也会被 token 校验拦截
             try:
-                self.root.after(0, self._on_stopped)
+                if self._stopped_token != token:
+                    self.root.after(0, lambda: self._on_stopped(token))
             except Exception:
                 pass
 
@@ -420,6 +428,7 @@ class WallpaperApp:
         if not self.running:
             return
         self.running = False
+        self._stopped_token = self._run_token
         self.log("■ 正在停止（卸载桌面嵌入层）…")
         if self.player is not None:
             self.player.stop()
@@ -429,9 +438,12 @@ class WallpaperApp:
                 os.remove(self._m3u_path)
             except Exception:
                 pass
-        self._on_stopped()
+        self._on_stopped(self._run_token)
 
-    def _on_stopped(self):
+    def _on_stopped(self, token=None):
+        # token 校验: 仅当仍是同一轮运行时才复位按钮, 防止旧线程的延迟回调误复位新一轮
+        if token is not None and token != self._run_token:
+            return
         self.running = False
         self._set_inputs("normal")
         self._on_switch_mode()
