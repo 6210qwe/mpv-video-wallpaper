@@ -61,7 +61,8 @@
   实测：不加 LAYERED 时窗口能挂上 WorkerW 但黑屏；加上后视频正常出画面。
 - **创建时即为 WorkerW 子窗口**，不走 `SetParent`，绕开“被静默丢弃”的坑。
 - **退出只销毁窗口 + 终止 mpv 进程**，不调用 `SystemParametersInfo`，因此不会累积损坏桌面状态——这正是「能频繁开关」的根本原因。
-- **运行中切视频 / 改填充 / 改声音全部走 mpv IPC**，不重新嵌入桌面，从源头上杜绝“父窗口失败”。
+- **切视频不靠 `--{ }` 分组、也不靠脚本在 EOF 后硬切**：按视频时长 / 单视频模式把路径写成 `.m3u8` 播放列表文件交给 mpv（`--playlist` + `--loop-playlist=inf`），文件数无上限；固定时长模式则让当前视频 `--loop=inf` 一直在播放中循环，用定时器 `loadfile` 在「播放中途」切下一个，根本不会走到 EOF 冻结。
+- **运行中改填充 / 改声音走 mpv IPC**（`set_property`），不重新嵌入桌面，也不重建播放列表。
 
 ### 2.1 兼容性说明
 
@@ -109,7 +110,7 @@ python mpv_wallpaper.py "D:\video.mp4" --mpv "C:\mpv\mpv.exe"
 ### 4.3 目录循环（无限轮播，原比例，每视频 10 秒）
 
 ```bash
-python mpv_wallpaper.py "D:\videos" --fill contain --rounds 0 --interval 10
+python mpv_wallpaper.py "D:\videos" --fill contain --interval 10
 ```
 
 ### 4.4 开启声音
@@ -128,8 +129,7 @@ python mpv_wallpaper.py "D:\video.mp4" --audio
 | `--audio` | 关闭 | 加此参数才出声（默认静音） |
 | `--vo` | `direct3d` | 渲染器：`direct3d` / `gpu` / `auto` |
 | `--hwdec` | `auto-copy` | 硬件解码：`auto-copy` / `auto` / `no` |
-| `--rounds` | `0` | 目录循环轮数，`0`=无限循环 |
-| `--interval` | `10` | 每视频播放秒数（目录模式） |
+| `--interval` | `10` | 每视频最大播放秒数（目录模式，`0`=按视频时长播完） |
 
 > 提示：桌面出现黑屏时，尝试 `--vo gpu`；mpv 秒退时，尝试 `--hwdec no`。
 
@@ -163,7 +163,7 @@ python mpv_wallpaper_gui.py
 
 1. **退出路径干净**：只 `DestroyWindow` + 终止 mpv，**绝不调用 `SystemParametersInfo`**，
    因而不会损坏 explorer 的桌面合成状态机。
-2. **运行中零重嵌**：切换视频 / 改填充 / 改声音全部走 mpv IPC（`loadfile` / `set_property`），
+2. **运行中零重嵌**：按视频时长模式由 mpv 播放列表内部切换（`--loop-playlist=inf`），固定时长模式由定时器 `loadfile` 在播放中途切换（当前视频 `--loop=inf` 永不 EOF）；改填充 / 改声音走 mpv IPC（`set_property`），
    不创建也不销毁嵌入窗口，从根本上消除“父窗口失败”的触发条件。
 3. **一次性嵌入**：整个生命周期只在启动时嵌入一次桌面，之后全程复用同一个窗口。
 

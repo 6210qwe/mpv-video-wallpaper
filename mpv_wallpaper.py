@@ -13,7 +13,7 @@ mpv 视频壁纸播放器 (Win11 25H2 / Build 26200 兼容)
 
 命令行:
   python mpv_wallpaper.py "D:\\a.mp4" --mpv "C:\\mpv\\mpv.exe"
-  python mpv_wallpaper.py "D:\\videos" --fill contain --rounds 0 --mpv "C:\\mpv\\mpv.exe"
+  python mpv_wallpaper.py "D:\\videos" --fill contain --interval 10 --mpv "C:\\mpv\\mpv.exe"
 """
 
 import ctypes
@@ -24,6 +24,7 @@ import time
 import os
 import json
 import glob
+import re
 import random
 import sys
 import argparse
@@ -199,18 +200,18 @@ class WallpaperPlayer:
 
     嵌入策略: 窗口创建时即设为 Progman 下 WorkerW 的 LAYERED 子窗口。
     退出: 终止 mpv -> CloseHandle -> DestroyWindow, 不损坏桌面状态机。
-    运行中切视频/改填充/改声音全部走 mpv IPC, 不重嵌、不重启。
+    改填充/改声音走 mpv IPC; 切视频在按时长/单视频模式下由 mpv 内部循环完成,
+    固定时长模式下才走 IPC loadfile 切换。全程不重嵌、不重启桌面。
     """
 
     PIPE_NAME = r"\\.\pipe\mpvwallpaper"
 
     def __init__(self, mpv_path=None, vo="direct3d", hwdec="auto-copy",
-                 fill="cover", audio=True, loop=True):
+                 fill="cover", audio=True):
         self.vo = vo
         self.hwdec = hwdec
         self.fill = fill
         self.audio = audio          # True=有声(默认不静音) / False=静音
-        self.loop = loop            # True=单曲循环(壁纸常驻) / False=播一次靠脚本切换(轮播)
         self._auto_mpv = mpv_path is None   # 是否走自动查找
         self.mpv_path = mpv_path or self._find_mpv()
         self.hwnd = None
@@ -321,15 +322,21 @@ class WallpaperPlayer:
         return True
 
     # -------------------- 启动 mpv --------------------
-    def launch_mpv(self, video_path):
-        """启动 mpv, 渲染到已嵌入的窗口 (仅需调用一次)"""
+    def launch(self, files, playlist_file=None):
+        """启动 mpv 播放 files (路径列表)。只需调用一次。
+
+        - 单文件: --loop=inf 常驻壁纸
+        - 多文件 + playlist_file: --playlist=文件 --loop-playlist=inf
+              (mpv 内部循环切换, 可承载数万文件, 无 EOF 冻结, 不用 --{ } 分组)
+        - 多文件无 playlist_file: 兜底分支, 直接把文件列表当命令行参数
+              (当前 GUI/CLI 均不触发此分支; 文件数多时请用 playlist_file, 避免 argv 过长撑爆命令行)
+        """
+        if not files:
+            return False
         panscan = "1.0" if self.fill == "cover" else "0"
-        loop_flag = "--loop=inf" if self.loop else "--loop=no"
         cmd = [
             self.mpv_path,
             f"--wid={self.hwnd}",
-            loop_flag,
-            "--keep-open",
             "--no-terminal",
             f"--input-ipc-server={self.PIPE_NAME}",
             f"--vo={self.vo}",
@@ -339,14 +346,23 @@ class WallpaperPlayer:
             f"--panscan={panscan}",
             "--load-scripts=no",
             "--msg-level=all=v",
-            video_path,
         ]
         # 音频: 始终加载音轨, 用 mute 控制开关, 这样运行中也能即时切换
         cmd.insert(2, "--mute=yes" if not self.audio else "--mute=no")
 
+        if len(files) == 1:
+            cmd.append("--loop=inf")          # 单视频常驻壁纸
+            cmd.append(files[0])
+        elif playlist_file:
+            cmd.append(f"--playlist={playlist_file}")
+            cmd.append("--loop-playlist=inf")
+        else:
+            cmd.append("--loop-playlist=inf")
+            cmd += files
+
         print(f"  VO={self.vo}  hwdec={self.hwdec}  fill={self.fill} "
               f"(panscan={panscan})  audio={'开' if self.audio else '关'}")
-        print(f"  视频: {os.path.basename(video_path)}")
+        print(f"  视频数: {len(files)}  (mpv 内部循环切换, 无 EOF 冻结, 无 --{{}} 分组)")
 
         self.mpv_proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
@@ -366,8 +382,15 @@ class WallpaperPlayer:
                          daemon=True).start()
 
         self.pipe_handle = self._connect_pipe()
-        print("  IPC: 已连接" if self.pipe_handle else "  [!] IPC 未连接 (无法切换视频)")
+        print("  IPC: 已连接" if self.pipe_handle else "  [!] IPC 未连接 (无法运行时改填充/声音)")
         return True
+
+    def play(self, video_path, loop=True):
+        """切换视频 (不重嵌)。loop=True 让新视频 --loop=inf, 始终在播放中切换,
+        避开 EOF 冻结 (上次卡死就是因为 EOF + keep-open 后硬切)。"""
+        if loop:
+            return self._ipc_command(["loadfile", video_path, "replace", "--loop=inf"])
+        return self._ipc_command(["loadfile", video_path, "replace"])
 
     def _connect_pipe(self, retries=40, delay=0.15):
         for _ in range(retries):
@@ -391,10 +414,6 @@ class WallpaperPlayer:
         return kernel32.WriteFile(
             self.pipe_handle, data, len(data), ctypes.byref(written), None
         )
-
-    def play(self, video_path):
-        """切换视频 (不重新嵌入)"""
-        return self._ipc_command(["loadfile", video_path, "replace"])
 
     def set_panscan(self, value):
         """运行中改填充: 0=原比例, 1=铺满裁剪"""
@@ -443,6 +462,27 @@ class WallpaperPlayer:
 VIDEO_EXTS = ("*.mp4", "*.mkv", "*.avi", "*.webm", "*.mov", "*.flv")
 
 
+def natural_sort_key(path):
+    """自然排序 key: 把文件名里的数字当数值比较, 顺序与 Windows 资源管理器一致
+    (例如 '视频2.mp4' 排在 '视频10.mp4' 前面)。"""
+    return [int(t) if t.isdigit() else t.lower()
+            for t in re.split(r"(\d+)", path)]
+
+
+def write_playlist_file(paths, path=None):
+    """把路径列表写成 mpv 播放列表文件 (.m3u8, UTF-8), 供 --playlist 使用。
+    可承载任意数量文件 (不受命令行长度限制), 路径一行一个即可。返回文件路径。"""
+    if path is None:
+        import tempfile
+        fd, path = tempfile.mkstemp(prefix="mpvwp_", suffix=".m3u8")
+        os.close(fd)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("#EXTM3U\n")
+        for p in paths:
+            f.write(p.replace("\\", "/") + "\n")
+    return path
+
+
 def main():
     parser = argparse.ArgumentParser(description="mpv 视频壁纸 (Win11 26200 兼容)")
     parser.add_argument("path", help="视频文件或目录")
@@ -454,10 +494,10 @@ def main():
                         help="cover=铺满裁剪, contain=原视频比例 (默认 cover)")
     parser.add_argument("--audio", action="store_true", default=False,
                         help="开启声音 (默认静音)")
-    parser.add_argument("--rounds", type=int, default=0,
-                        help="目录循环轮数, 0=无限循环 (默认 0)")
     parser.add_argument("--interval", type=int, default=10,
-                        help="每视频播放秒数 (默认 10)")
+                        help="固定间隔模式: 每视频最大播放秒数 (默认 10)")
+    parser.add_argument("--duration", action="store_true", default=False,
+                        help="按视频时长播放(不截断); 默认按 --interval 固定间隔切换")
     parser.add_argument("--mpv", default=None, help="mpv.exe 路径")
     args = parser.parse_args()
 
@@ -480,17 +520,16 @@ def main():
 
     print(f"视频数量: {len(videos)}")
     if single_mode:
-        print("模式: 单视频 (Ctrl+C 退出)")
+        print("模式: 单视频常驻 (Ctrl+C 退出)")
+    elif args.duration:
+        print("模式: 目录循环 - 按视频时长 (Ctrl+C 退出)")
     else:
-        mode = "无限循环" if args.rounds == 0 else f"{args.rounds} 轮"
-        print(f"模式: 目录循环 ({mode}, 每视频 {args.interval}s, Ctrl+C 退出)")
+        print(f"模式: 目录循环 - 固定间隔 {args.interval}s (Ctrl+C 退出)")
 
-    # 单视频 / 仅 1 个视频的目录 → 循环播放(常驻壁纸);
-    # 多视频目录 → 播一次靠脚本切换(避免回放开头几秒)
-    loop = single_mode or len(videos) == 1
+    # 单视频 → --loop=inf 常驻; 多视频 → 播放列表文件(时长) 或 定时 loadfile(固定间隔)
     player = WallpaperPlayer(
         mpv_path=args.mpv, vo=args.vo, hwdec=args.hwdec,
-        fill=args.fill, audio=args.audio, loop=loop,
+        fill=args.fill, audio=args.audio,
     )
 
     print("\n[1/3] 前置检查...")
@@ -505,54 +544,58 @@ def main():
     print(f"  窗口已嵌入桌面 (hwnd={player.hwnd})")
 
     print("\n[3/3] 启动 mpv...")
-    if not player.launch_mpv(videos[0]):
-        player.stop()
-        return
+    m3u_path = None
+    if single_mode:
+        if not player.launch([videos[0]]):
+            player.stop()
+            return
+    elif args.duration:
+        m3u_path = write_playlist_file(videos)
+        if not player.launch(videos, playlist_file=m3u_path):
+            player.stop()
+            return
+    else:
+        # 固定间隔: 首视频 --loop=inf 常驻, 定时器 loadfile 切换 (播放中途切, 避开 EOF 冻结)
+        if not player.launch([videos[0]]):
+            player.stop()
+            return
     time.sleep(2)
 
-    if single_mode:
-        print("\n播放中... (Ctrl+C 退出)\n")
-        try:
+    print("\n播放中... (Ctrl+C 退出)\n")
+    try:
+        if single_mode or args.duration:
             while player.is_running():
                 time.sleep(1)
-        except KeyboardInterrupt:
-            print("\n[Ctrl+C]")
-        finally:
-            player.stop()
-        if not player.is_running():
-            print("\n[mpv 已自行退出]")
-            if player.mpv_proc is not None:
-                print(f"  退出码: {player.mpv_proc.returncode}")
-            player.dump_mpv_output()
-            print("\n可尝试:")
-            print(f'  python "{sys.argv[0]}" "{args.path}" --vo gpu --mpv "{args.mpv}"')
-            print(f'  python "{sys.argv[0]}" "{args.path}" --vo direct3d --hwdec no --mpv "{args.mpv}"')
-    else:
-        print("\n循环播放中... (Ctrl+C 退出)\n")
-        round_num = 0
-        try:
-            while args.rounds == 0 or round_num < args.rounds:
-                round_num += 1
-                if args.rounds != 0:
-                    print(f"===== 第 {round_num}/{args.rounds} 轮 =====")
-                random.shuffle(videos)
-                for i, video in enumerate(videos):
+        else:
+            idx = 1
+            n = len(videos)
+            while player.is_running():
+                player.play(videos[idx % n], loop=True)   # 播放中途切换, 不踩 EOF
+                idx += 1
+                for _ in range(max(1, args.interval) * 10):
                     if not player.is_running():
-                        print("[!] mpv 已退出, 停止循环")
                         break
-                    player.play(video)
-                    print(f"  [{i+1}/{len(videos)}] {os.path.basename(video)}")
-                    time.sleep(args.interval)
-                else:
-                    continue
-                break
-            else:
-                if args.rounds != 0:
-                    print("\n所有轮次播放完毕")
-        except KeyboardInterrupt:
-            print("\n[Ctrl+C]")
-        finally:
-            player.stop()
+                    time.sleep(0.1)
+                if not player.is_running():
+                    break
+    except KeyboardInterrupt:
+        print("\n[Ctrl+C]")
+    finally:
+        player.stop()
+        if m3u_path and os.path.isfile(m3u_path):
+            try:
+                os.remove(m3u_path)
+            except Exception:
+                pass
+
+    if not player.is_running():
+        print("\n[mpv 已自行退出]")
+        if player.mpv_proc is not None:
+            print(f"  退出码: {player.mpv_proc.returncode}")
+        player.dump_mpv_output()
+        print("\n可尝试:")
+        print(f'  python "{sys.argv[0]}" "{args.path}" --vo gpu --mpv "{args.mpv}"')
+        print(f'  python "{sys.argv[0]}" "{args.path}" --vo direct3d --hwdec no --mpv "{args.mpv}"')
 
 
 if __name__ == "__main__":

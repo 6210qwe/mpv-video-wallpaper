@@ -12,7 +12,6 @@ import os
 import json
 import time
 import glob
-import struct
 import random
 import threading
 import tkinter as tk
@@ -27,34 +26,6 @@ CONFIG_PATH = os.path.join(
 DEFAULT_WAIT = 30
 
 
-def get_mp4_duration(path):
-    """纯 Python 读取 mp4 时长（秒），无需 ffmpeg。失败返回 None。"""
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except Exception:
-        return None
-    moov = data.find(b"moov")
-    if moov == -1:
-        return None
-    idx = data.find(b"mvhd", moov)
-    if idx == -1:
-        return None
-    try:
-        version = data[idx + 8]
-        if version == 1:
-            timescale = struct.unpack(">I", data[idx + 24:idx + 28])[0]
-            duration = struct.unpack(">Q", data[idx + 28:idx + 36])[0]
-        else:
-            timescale = struct.unpack(">I", data[idx + 16:idx + 20])[0]
-            duration = struct.unpack(">I", data[idx + 20:idx + 24])[0]
-    except Exception:
-        return None
-    if timescale == 0:
-        return None
-    return duration / timescale
-
-
 class WallpaperApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -67,6 +38,7 @@ class WallpaperApp:
         self._build_ui()
         self._apply_config()
         self._on_switch_mode()
+        self._on_single_changed()
 
     # ------------------------------------------------------------------ #
     # 配置（自动持久化）
@@ -86,6 +58,7 @@ class WallpaperApp:
             "switch_mode": self.switch_mode.get(),
             "wait": self.wait_var.get(),
             "subfolders": self.subfolders.get(),
+            "single": self.single_var.get(),
             "panscan": self.panscan_var.get(),
             "audio": self.audio_var.get(),
         }
@@ -103,6 +76,7 @@ class WallpaperApp:
         self.switch_mode = tk.StringVar(value="fixed")
         self.wait_var = tk.IntVar(value=DEFAULT_WAIT)
         self.subfolders = tk.BooleanVar(value=False)
+        self.single_var = tk.BooleanVar(value=False)   # True=单个视频(循环播放)
         self.panscan_var = tk.StringVar(value="1.0")   # "0.0" 原比例 / "1.0" 铺满裁剪
         self.audio_var = tk.BooleanVar(value=False)    # True=有声 / False=静音
 
@@ -113,6 +87,7 @@ class WallpaperApp:
         self.switch_mode.set(self.config.get("switch_mode", "fixed"))
         self.wait_var.set(self.config.get("wait", DEFAULT_WAIT))
         self.subfolders.set(self.config.get("subfolders", False))
+        self.single_var.set(self.config.get("single", False))
         self.panscan_var.set(str(self.config.get("panscan", "1.0")))
         self.audio_var.set(self.config.get("audio", False))
 
@@ -143,6 +118,10 @@ class WallpaperApp:
         self.w_sub_chk = ttk.Checkbutton(f1, text="包含子文件夹",
                                          variable=self.subfolders)
         self.w_sub_chk.pack(anchor="w", pady=(6, 0))
+        self.w_single_chk = ttk.Checkbutton(
+            f1, text="单个视频（循环播放）", variable=self.single_var,
+            command=self._on_single_changed)
+        self.w_single_chk.pack(anchor="w", pady=(2, 0))
 
         # mpv 路径
         f2 = ttk.LabelFrame(self.root, text="mpv.exe 路径（留空自动查找）",
@@ -230,9 +209,17 @@ class WallpaperApp:
     # 交互
     # ------------------------------------------------------------------ #
     def _browse_video(self):
-        d = filedialog.askdirectory(title="选择视频目录")
-        if d:
-            self.video_dir.set(d)
+        if self.single_var.get():
+            f = filedialog.askopenfilename(
+                title="选择单个视频文件",
+                filetypes=[("视频文件", "*.mp4;*.mkv;*.avi;*.webm;*.mov;*.flv"),
+                           ("所有文件", "*.*")])
+            if f:
+                self.video_dir.set(f)
+        else:
+            d = filedialog.askdirectory(title="选择视频目录")
+            if d:
+                self.video_dir.set(d)
 
     def _browse_mpv(self):
         f = filedialog.askopenfilename(title="选择 mpv.exe",
@@ -246,6 +233,17 @@ class WallpaperApp:
             self.w_wait_spin.configure(state=state)
         except Exception:
             pass
+
+    def _on_single_changed(self):
+        """单个视频模式: 禁用与目录 / 轮播相关的控件"""
+        single = self.single_var.get()
+        state = "disabled" if single else "normal"
+        for w in (self.w_sub_chk, self.w_mode_random, self.w_mode_seq,
+                  self.w_switch_fixed, self.w_switch_dur, self.w_wait_spin):
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
 
     def _set_inputs(self, state):
         for w in (self.w_video_entry, self.w_video_btn, self.w_sub_chk,
@@ -284,23 +282,23 @@ class WallpaperApp:
     # ------------------------------------------------------------------ #
     def _scan_videos(self):
         base = self.video_dir.get()
-        pattern = os.path.join(base, "**", "*.mp4") if self.subfolders.get() \
-            else os.path.join(base, "*.mp4")
-        return sorted(glob.glob(pattern, recursive=self.subfolders.get()))
+        exts = mpv_wallpaper.VIDEO_EXTS
+        files = []
+        if self.subfolders.get():
+            for ext in exts:
+                files.extend(glob.glob(os.path.join(base, "**", ext),
+                                      recursive=True))
+        else:
+            for ext in exts:
+                files.extend(glob.glob(os.path.join(base, ext)))
+        # 自然排序, 与 Windows 资源管理器一致 (数字按数值比, 如 2 < 10)
+        return sorted(files, key=mpv_wallpaper.natural_sort_key)
 
     def _build_playlist(self, videos):
         pl = list(videos)
         if self.mode.get() == "random":
             random.shuffle(pl)
         return pl
-
-    def _wait_secs(self, video_path):
-        if self.switch_mode.get() == "duration":
-            dur = get_mp4_duration(video_path)
-            if dur:
-                return dur + 1.0
-            self.log("    ⚠ 无法读取时长，回退到固定间隔")
-        return float(max(1, self.wait_var.get()))
 
     def _on_fill_changed(self):
         """运行中改填充：运行时下发 panscan, 不重嵌。"""
@@ -315,29 +313,41 @@ class WallpaperApp:
         self.player.set_mute(not self.audio_var.get())
 
     def start(self):
-        video_dir = self.video_dir.get().strip()
         mpv_path = self.mpv_path.get().strip()
-        if not video_dir or not os.path.isdir(video_dir):
-            self.log("⚠ 请先选择有效的视频目录")
-            return
-        videos = self._scan_videos()
-        if not videos:
-            self.log("⚠ 该目录没有找到 mp4 视频")
-            return
+        if self.single_var.get():
+            # 单个视频: 循环播放该文件 (最稳, 全程零切换, 无 EOF 冻结)
+            f = self.video_dir.get().strip()
+            if not f or not os.path.isfile(f):
+                self.log("⚠ 请先选择单个视频文件")
+                return
+            videos = [os.path.abspath(f)]
+        else:
+            video_dir = self.video_dir.get().strip()
+            if not video_dir or not os.path.isdir(video_dir):
+                self.log("⚠ 请先选择有效的视频目录")
+                return
+            videos = self._scan_videos()
+            if not videos:
+                self.log("⚠ 该目录没有找到视频文件")
+                return
 
         playlist = self._build_playlist(videos)
         self._playlist = playlist
-        mode_name = "随机" if self.mode.get() == "random" else "顺序"
-        switch_name = "按视频时长" if self.switch_mode.get() == "duration" else "固定时长"
-        self.log(f"▶ 启动壁纸：共 {len(videos)} 个视频，{mode_name} / {switch_name}")
+        if len(videos) == 1:
+            self.log(f"▶ 启动壁纸：单个视频循环 → {os.path.basename(videos[0])}")
+        else:
+            mode_name = "随机" if self.mode.get() == "random" else "顺序"
+            switch_name = "按视频时长" if self.switch_mode.get() == "duration" else "固定时长"
+            self.log(f"▶ 启动壁纸：共 {len(videos)} 个视频，{mode_name} / {switch_name}")
 
         # 创建播放器 + 嵌入桌面 + 启动 mpv（仅此一次 embed）
-        # 多视频目录不循环(播一次靠脚本切换, 避免回放开头); 仅 1 个视频则循环常驻
+        # 按视频时长(多文件): 写成 m3u8 播放列表交给 mpv 内部循环(可承载数万文件, 无 EOF 冻结)
+        # 单视频: 直接 --loop=inf 常驻(不写 m3u8)
+        # 固定时长: 首视频 --loop=inf, 定时器 loadfile 切换(播放中途切, 不踩 EOF), 不用 --{ } 分组
         self.player = mpv_wallpaper.WallpaperPlayer(
             mpv_path=mpv_path or None,
             fill="cover" if self.panscan_var.get() == "1.0" else "contain",
             audio=self.audio_var.get(),
-            loop=(len(videos) == 1),
         )
         if not self.player.check_prerequisites():
             self.player = None
@@ -346,10 +356,22 @@ class WallpaperApp:
             self.player.stop()
             self.player = None
             return
-        if not self.player.launch_mpv(playlist[0]):
-            self.player.stop()
-            self.player = None
-            return
+
+        self._m3u_path = None
+        use_duration = (self.switch_mode.get() == "duration") or len(playlist) == 1
+        if use_duration:
+            # 时长模式 / 单视频: 播放列表文件 + mpv 内部循环
+            if len(playlist) == 1:
+                if not self.player.launch([playlist[0]]):
+                    self.player.stop(); self.player = None; return
+            else:
+                self._m3u_path = mpv_wallpaper.write_playlist_file(playlist)
+                if not self.player.launch(playlist, playlist_file=self._m3u_path):
+                    self.player.stop(); self.player = None; return
+        else:
+            # 固定时长: 首视频 --loop=inf, 之后定时 loadfile 切换
+            if not self.player.launch([playlist[0]]):
+                self.player.stop(); self.player = None; return
 
         self.running = True
         self._set_inputs("disabled")
@@ -361,23 +383,31 @@ class WallpaperApp:
     def _playback_loop(self):
         try:
             playlist = self._playlist
-            # 第一支已在 start() 里播上(已是洗牌/顺序后的 playlist[0]), 这里只等时长 → 切下一个
-            self._wait(self._wait_secs(playlist[0]))
-            idx = 1
-            while self.running:
-                if idx >= len(playlist):          # 一轮播完 → 重新洗牌/顺序, 继续循环
-                    playlist = self._build_playlist(self._scan_videos())
-                    self._playlist = playlist
-                    idx = 0
-                item = playlist[idx]
-                name = os.path.basename(item)
-                if not self.player.is_running():
-                    self.log("  ✗ mpv 已退出（桌面状态可能已退化，建议重启电脑后重试）")
-                    break
-                self.player.play(item)
-                self.log(f"  ▶ {name}  ({idx + 1}/{len(playlist)})")
-                self._wait(self._wait_secs(item))
-                idx += 1
+            n = len(playlist)
+            if (self.switch_mode.get() == "duration") or n == 1:
+                # 时长模式 / 单视频: mpv 内部循环, 这里只监控存活
+                self.log(f"▶ 已启动（mpv 内部循环），共 {n} 个视频")
+                while self.running:
+                    if not self.player.is_running():
+                        self.log("  ✗ mpv 已退出（桌面状态可能已退化，建议重启电脑后重试）")
+                        break
+                    time.sleep(1)
+            else:
+                # 固定时长: 定时 loadfile 切换 (当前视频恒在播放中, 避开 EOF 冻结)
+                interval = max(1, self.wait_var.get())
+                self.log(f"▶ 已启动，每 {interval}s 切换，共 {n} 个视频")
+                idx = 1  # 第 0 支已在 launch 中播上
+                while self.running:
+                    if not self.player.is_running():
+                        self.log("  ✗ mpv 已退出（桌面状态可能已退化，建议重启电脑后重试）")
+                        break
+                    self.player.play(playlist[idx % n], loop=True)
+                    self.log(f"  ▶ {os.path.basename(playlist[idx % n])}  ({idx % n + 1}/{n})")
+                    idx += 1
+                    for _ in range(interval * 10):
+                        if not self.running:
+                            return
+                        time.sleep(0.1)
         except Exception as e:
             self.log(f"✗ 运行出错：{e}")
         finally:
@@ -385,12 +415,6 @@ class WallpaperApp:
                 self.root.after(0, self._on_stopped)
             except Exception:
                 pass
-
-    def _wait(self, secs):
-        for _ in range(int(secs * 10)):
-            if not self.running:
-                return
-            time.sleep(0.1)
 
     def stop(self):
         if not self.running:
@@ -400,6 +424,11 @@ class WallpaperApp:
         if self.player is not None:
             self.player.stop()
             self.player = None
+        if getattr(self, "_m3u_path", None) and os.path.isfile(self._m3u_path):
+            try:
+                os.remove(self._m3u_path)
+            except Exception:
+                pass
         self._on_stopped()
 
     def _on_stopped(self):
